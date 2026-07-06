@@ -40,6 +40,9 @@ CREATE TABLE IF NOT EXISTS events (
   payload_json TEXT NOT NULL,
   provider     TEXT,
   model        TEXT,
+  cwd          TEXT NOT NULL DEFAULT '',
+  session_file TEXT,
+  agent_name   TEXT,
   FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
 
@@ -48,6 +51,25 @@ CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS idx_events_pool ON events(pool);
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(type);
 CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id);
+
+-- ── Bus: command queue (overlord → workers) ──
+CREATE TABLE IF NOT EXISTS commands (
+  command_id      TEXT PRIMARY KEY,         -- ULID, server-generated
+  target_agent    TEXT NOT NULL,            -- e.g. 'noledge', 'gg-obs', 'demoshots', 'overlord'
+  target_pool     TEXT NOT NULL DEFAULT 'default',
+  action          TEXT NOT NULL,            -- dotted verb: 'task.dispatch', 'task.ack', 'task.report'
+  payload_json    TEXT NOT NULL DEFAULT '{}',
+  created_ts      TEXT NOT NULL,            -- ISO-8601
+  created_by      TEXT NOT NULL,            -- issuer (overlord's session_id, or 'human')
+  ack_state       TEXT NOT NULL DEFAULT 'pending',  -- pending | acked | failed | expired
+  ack_session_id  TEXT,
+  ack_ts          TEXT,
+  ack_payload_json TEXT,
+  seq             INTEGER NOT NULL,         -- monotonic per (target_agent), polling cursor
+  UNIQUE(target_agent, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_commands_target_state ON commands(target_agent, ack_state, seq);
+CREATE INDEX IF NOT EXISTS idx_commands_created_ts ON commands(created_ts);
 `;
 
 // ─── Prepared queries ──────────────────────────────────────────────────────
@@ -62,6 +84,12 @@ export interface PreparedQueries {
   getSessionStats: Database.Statement;
   getSessionContext: Database.Statement;
   countTotals: Database.Statement;
+  // Bus: command queue
+  insertCommand: Database.Statement;
+  getCommand: Database.Statement;
+  listCommands: Database.Statement;
+  ackCommand: Database.Statement;
+  nextCommandSeq: Database.Statement;
 }
 
 // ─── Init ───────────────────────────────────────────────────────────────────
@@ -70,10 +98,18 @@ export function createDb(path: string): Database.Database {
   const db = new Database(path);
   db.pragma("journal_mode = WAL");
   db.pragma("busy_timeout = 5000");
-  // Match the original bun:sqlite deployment behavior: FK enforcement off so
-  // that an event INSERT can land before its parent session row exists.
-  // The (session_id, seq) UNIQUE index still guarantees idempotency.
-  db.pragma("foreign_keys = OFF");
+  // FK enforcement ON: the server upserts the parent session row before
+  // inserting the event, so the FK can be trusted. The (session_id, seq)
+  // UNIQUE index still guarantees wire-contract idempotency.
+  db.pragma("foreign_keys = ON");
+
+  // Migrate older DBs: add the new envelope columns if missing. Safe to run
+  // every startup — ADD COLUMN errors are swallowed per column.
+  const eventsCols = (db.prepare(`PRAGMA table_info(events)`).all() as Array<{ name: string }>).map((c) => c.name);
+  if (!eventsCols.includes("cwd"))          try { db.exec(`ALTER TABLE events ADD COLUMN cwd TEXT NOT NULL DEFAULT ''`); } catch {}
+  if (!eventsCols.includes("session_file")) try { db.exec(`ALTER TABLE events ADD COLUMN session_file TEXT`); } catch {}
+  if (!eventsCols.includes("agent_name"))   try { db.exec(`ALTER TABLE events ADD COLUMN agent_name TEXT`); } catch {}
+
   db.exec(SCHEMA);
   return db;
 }
@@ -82,9 +118,9 @@ export function prepare(db: Database.Database): PreparedQueries {
   // ── Insert event (idempotent) ───────────────────────────────────────────
   const insertEvent = db.prepare(`
     INSERT OR IGNORE INTO events
-      (event_id, session_id, seq, ts, type, pool, tags_json, payload_json, provider, model)
+      (event_id, session_id, seq, ts, type, pool, tags_json, payload_json, provider, model, cwd, session_file, agent_name)
     VALUES
-      (@event_id, @session_id, @seq, @ts, @type, @pool, @tags_json, @payload_json, @provider, @model)
+      (@event_id, @session_id, @seq, @ts, @type, @pool, @tags_json, @payload_json, @provider, @model, @cwd, @session_file, @agent_name)
   `);
 
   // ── Upsert session (bumps event_count) ──────────────────────────────────
@@ -163,7 +199,7 @@ export function prepare(db: Database.Database): PreparedQueries {
   // ── Get events for a session (backward pagination) ─────────────────────
   const getSessionEvents = db.prepare(`
     SELECT
-      event_id, session_id, seq, ts, type, pool, tags_json, payload_json, provider, model
+      event_id, session_id, seq, ts, type, pool, tags_json, payload_json, provider, model, cwd, session_file, agent_name
     FROM events
     WHERE session_id = @session_id
       AND (@type = '' OR type = @type)
@@ -175,7 +211,7 @@ export function prepare(db: Database.Database): PreparedQueries {
   // ── Get events since seq (forward resync) ──────────────────────────────
   const getSessionEventsSince = db.prepare(`
     SELECT
-      event_id, session_id, seq, ts, type, pool, tags_json, payload_json, provider, model
+      event_id, session_id, seq, ts, type, pool, tags_json, payload_json, provider, model, cwd, session_file, agent_name
     FROM events
     WHERE session_id = @session_id
       AND seq > @since_seq
@@ -218,6 +254,49 @@ export function prepare(db: Database.Database): PreparedQueries {
       (SELECT COUNT(*) FROM sessions) AS sessions_total
   `);
 
+  // ── Bus: next seq for a target_agent (monotonic per agent) ──────────────
+  const nextCommandSeq = db.prepare(`
+    SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq
+    FROM commands WHERE target_agent = ?
+  `);
+
+  // ── Bus: insert command ─────────────────────────────────────────────────
+  const insertCommand = db.prepare(`
+    INSERT INTO commands
+      (command_id, target_agent, target_pool, action, payload_json, created_ts, created_by, ack_state, seq)
+    VALUES
+      (@command_id, @target_agent, @target_pool, @action, @payload_json, @created_ts, @created_by, 'pending', @seq)
+  `);
+
+  // ── Bus: get one command ────────────────────────────────────────────────
+  const getCommand = db.prepare(`
+    SELECT command_id, target_agent, target_pool, action, payload_json, created_ts, created_by,
+           ack_state, ack_session_id, ack_ts, ack_payload_json, seq
+    FROM commands WHERE command_id = ?
+  `);
+
+  // ── Bus: list commands (filter by target + status; since-seq pagination) ─
+  const listCommands = db.prepare(`
+    SELECT command_id, target_agent, target_pool, action, payload_json, created_ts, created_by,
+           ack_state, ack_session_id, ack_ts, ack_payload_json, seq
+    FROM commands
+    WHERE (@target = '' OR target_agent = @target)
+      AND (@status = '' OR ack_state = @status)
+      AND (@since_seq = 0 OR seq > @since_seq)
+    ORDER BY seq ASC
+    LIMIT @limit
+  `);
+
+  // ── Bus: ack a command (worker reports done/failed) ─────────────────────
+  const ackCommand = db.prepare(`
+    UPDATE commands
+    SET ack_state = @ack_state,
+        ack_session_id = @ack_session_id,
+        ack_ts = @ack_ts,
+        ack_payload_json = @ack_payload_json
+    WHERE command_id = @command_id AND ack_state = 'pending'
+  `);
+
   return {
     insertEvent,
     upsertSession,
@@ -228,6 +307,11 @@ export function prepare(db: Database.Database): PreparedQueries {
     getSessionStats,
     getSessionContext,
     countTotals,
+    insertCommand,
+    getCommand,
+    listCommands,
+    ackCommand,
+    nextCommandSeq,
   };
 }
 
@@ -245,6 +329,9 @@ export function toRow(e: ObsEvent): Record<string, unknown> {
     payload_json: JSON.stringify(e.payload ?? {}),
     provider: e.provider ?? null,
     model: e.model ?? null,
+    cwd: e.cwd ?? "",
+    session_file: e.session_file ?? null,
+    agent_name: e.agent_name ?? null,
   };
 }
 
@@ -303,6 +390,8 @@ export function rowToEvent(row: any): ObsEvent {
     type: row.type,
     session_id: row.session_id,
     cwd: row.cwd ?? "",
+    session_file: row.session_file ?? undefined,
+    agent_name: row.agent_name ?? undefined,
     pool: row.pool,
     tags,
     provider: row.provider ?? undefined,

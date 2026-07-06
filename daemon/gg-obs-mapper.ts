@@ -70,6 +70,7 @@ interface GgUnknownBlock    { type: string; [k: string]: unknown }
 type GgContentBlock = GgTextBlock | GgThinkingBlock | GgToolCallBlock | GgToolResultBlock | GgRawBlock | GgUnknownBlock;
 
 interface GgMessage {
+  type: "message";
   id: string;
   parentId: string | null;
   timestamp: string;
@@ -79,7 +80,7 @@ interface GgMessage {
   };
 }
 
-type GgLine = GgSessionHeader | (GgMessage & { type: "message" }) | { type: string; [k: string]: unknown };
+type GgLine = GgSessionHeader | GgMessage | { type: string; [k: string]: unknown };
 
 // ─── Public API ─────────────────────────────────────────────────────────────
 
@@ -109,7 +110,7 @@ export function* mapSession(
     return;
   }
 
-  const messages = lines.filter((l): l is GgMessage => (l as any).type === "message") as GgMessage[];
+  const messages = lines.filter((l): l is GgMessage => l.type === "message");
   const childrenByParent = buildChildIndex(messages);
 
   const sessionInfo: SessionSessionInfo = {
@@ -220,12 +221,9 @@ export function* mapSession(
         for (const tr of toolResults) {
           yield makeEnvelope<ToolResultPayload>("tool_result", sessionInfo, next(), msg.timestamp, tr);
         }
-        // If the next message is NOT another tool/assistant (i.e. the user speaks),
-        // close the turn. We can't peek forward here, so close eagerly after each
-        // tool_result batch — the next assistant message will start a new turn.
-        yield makeEnvelope<TurnEndPayload>("turn_end", sessionInfo, next(), msg.timestamp, { turn_index: turnIndex });
-        openTurn.started = false;
-        turnIndex++;
+        // tool_result is part of the *same* assistant turn that issued the call;
+        // turn_end is emitted by the user-message boundary or the trailing close
+        // below. Do not increment turn_index here.
         break;
       }
 

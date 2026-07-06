@@ -45,6 +45,17 @@ fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 const AUTH_TOKEN = process.env.OBS_AUTH_TOKEN ?? crypto.randomUUID();
 const VERSION = "0.1.0";
 
+// Persist the token to a file the helper reads, so server restarts and the
+// CLI helper stay in sync without env-var coordination. Only writes if
+// the file doesn't already exist (don't clobber a stable deployed token).
+try {
+  const tokenPath = path.join(os.homedir(), ".gg", "observability", "token");
+  fs.mkdirSync(path.dirname(tokenPath), { recursive: true });
+  if (!fs.existsSync(tokenPath)) {
+    fs.writeFileSync(tokenPath, AUTH_TOKEN, { mode: 0o600 });
+  }
+} catch { /* non-fatal */ }
+
 const OPEN_URL = `http://${HOST}:${PORT}/?token=${encodeURIComponent(AUTH_TOKEN)}`;
 
 // ─── Init ───────────────────────────────────────────────────────────────────
@@ -155,10 +166,16 @@ function serveStatic(rel: string): Response | null {
   const filePath = safeStaticPath(rel);
   if (!filePath) return null;
   if (!fs.existsSync(filePath)) return null;
-  const stat = fs.statSync(filePath);
+  const stat = fs.statSync(filePath); // follows symlinks
   if (!stat.isFile()) return null;
-  const body = fs.readFileSync(filePath);
-  const filename = path.basename(filePath);
+  // S8: reject if a symlink resolved outside UI_DIR. Compare realpath to the
+  // realpath of UI_DIR (not the joined prefix) so macOS's /var → /private
+  // prefix doesn't false-positive.
+  const real = fs.realpathSync.native ? fs.realpathSync.native(filePath) : fs.realpathSync(filePath);
+  const uiReal = fs.realpathSync.native ? fs.realpathSync.native(UI_DIR) : fs.realpathSync(UI_DIR);
+  if (!real.startsWith(uiReal + path.sep) && real !== uiReal) return null;
+  const body = fs.readFileSync(real);
+  const filename = path.basename(real);
   return new Response(body, {
     headers: {
       "content-type": contentTypeFor(filename),
@@ -189,25 +206,41 @@ function checkAuth(req: Request, url: URL): boolean {
  * Ingest a single event: insert into DB, upsert session, broadcast to SSE.
  * Returns the event_id if ingested, null if duplicate.
  *
- * FK enforcement is disabled in db.ts so that the events row can land before
- * its parent sessions row, matching the original pi behavior. The
+ * Session is seeded BEFORE the event insert so the FK constraint
+ * (foreign_keys=ON) is satisfied. Both writes run inside a single transaction
+ * so a crash mid-ingest cannot leave an orphan event row. The
  * (session_id, seq) UNIQUE index still guarantees wire-contract idempotency.
+ *
+ * event_count is bumped exactly once per *new* event via upsertSession; the
+ * pre-seed uses INSERT OR IGNORE so it doesn't double-count.
  */
 function ingestEvent(event: ObsEvent): string | null {
-  const result = q.insertEvent.run(toRow(event));
-  const isNew = result.changes > 0;
+  const seedSession = db.prepare(`
+    INSERT OR IGNORE INTO sessions
+      (session_id, pool, agent_name, cwd, session_file, provider, model, first_ts, last_ts, event_count, tags_json)
+    VALUES
+      (@session_id, @pool, @agent_name, @cwd, @session_file, @provider, @model, @ts, @ts, 0, @tags_json)
+  `);
 
-  if (isNew) {
-    q.upsertSession.run(toSessionRow(event));
-  } else {
-    q.upsertSessionNoBump.run(toSessionRow(event));
-  }
+  const ingestTxn = db.transaction((evt: ObsEvent): string | null => {
+    const sessionRow = toSessionRow(evt);
+    seedSession.run(sessionRow); // FK target only — no event_count bump
+    const result = q.insertEvent.run(toRow(evt));
+    if (result.changes > 0) {
+      q.upsertSession.run(sessionRow); // bumps event_count by 1
+    } else {
+      q.upsertSessionNoBump.run(sessionRow);
+    }
+    return result.changes > 0 ? evt.event_id : null;
+  });
 
-  if (isNew) {
+  const ingestedId = ingestTxn(event);
+
+  if (ingestedId) {
     broadcastEvent(event);
   }
 
-  return isNew ? event.event_id : null;
+  return ingestedId;
 }
 
 async function readBody(req: Request): Promise<string> {
@@ -279,13 +312,13 @@ app.get("/logo.svg", (c) => serveStatic("logo.svg") ?? c.text("not found", 404))
 app.use("*", async (c, next) => {
   // Only enforce auth on API/SSE routes. UI assets and /health are handled
   // above; this middleware runs after those.
-  const path = c.req.path;
+  const reqPath = c.req.path;
   if (
-    path === "/health" ||
-    path === "/" ||
-    path === "/favicon.ico" ||
-    path === "/index.html" ||
-    /\.(js|css|svg|png|ico)$/.test(path)
+    reqPath === "/health" ||
+    reqPath === "/" ||
+    reqPath === "/favicon.ico" ||
+    reqPath === "/index.html" ||
+    /\.(js|css|svg|png|ico)$/.test(reqPath)
   ) {
     return next();
   }
@@ -336,13 +369,113 @@ app.post("/events", async (c) => {
   return c.json({ ingested: ingested.length, rejected });
 });
 
+// ── POST /commands — overlord dispatches a task to a worker ──────────────
+app.post("/commands", async (c) => {
+  const url = new URL(c.req.url);
+  if (!checkAuth(c.req.raw, url)) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  let body: any;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "invalid_json" }, 400);
+  }
+  const target_agent = String(body?.target_agent ?? "").trim();
+  const action = String(body?.action ?? "").trim();
+  if (!target_agent || !action) {
+    return c.json({ error: "missing_target_agent_or_action" }, 400);
+  }
+  const command_id = crypto.randomUUID();
+  const created_ts = new Date().toISOString();
+  const created_by = String(body?.created_by ?? "overlord").trim();
+  const target_pool = String(body?.target_pool ?? "default").trim();
+  const payload_json = JSON.stringify(body?.payload ?? {});
+
+  let seq: number;
+  try {
+    const row = q.nextCommandSeq.get(target_agent) as { next_seq: number };
+    seq = row.next_seq;
+  } catch (e: any) {
+    return c.json({ error: "db_error", detail: String(e?.message ?? e) }, 500);
+  }
+
+  try {
+    q.insertCommand.run({
+      command_id, target_agent, target_pool, action, payload_json, created_ts, created_by, seq,
+    });
+  } catch (e: any) {
+    return c.json({ error: "insert_failed", detail: String(e?.message ?? e) }, 500);
+  }
+
+  return c.json({ command_id, seq, created_ts, target_agent, action }, 201);
+});
+
+// ── GET /commands?target=&status=&since=&limit= — worker polls the queue ──
+app.get("/commands", (c) => {
+  const url = new URL(c.req.url);
+  if (!checkAuth(c.req.raw, url)) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const target = url.searchParams.get("target") ?? "";
+  const status = url.searchParams.get("status") ?? "pending";
+  const since = parseInt(url.searchParams.get("since") ?? "0", 10) || 0;
+  const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") ?? "50", 10) || 50, 1), 200);
+
+  try {
+    const rows = q.listCommands.all({ target, status, since_seq: since, limit });
+    // latest_seq: targeted MAX(seq) when target is set; otherwise the global max.
+    let latest_seq = 0;
+    if (target) {
+      const r = q.nextCommandSeq.get(target) as { next_seq: number };
+      latest_seq = r.next_seq - 1; // next_seq is "next"; current max is one less (or 0 if none)
+    } else {
+      const r = db.prepare("SELECT COALESCE(MAX(seq), 0) AS m FROM commands").get() as { m: number };
+      latest_seq = r.m;
+    }
+    return c.json({ commands: rows, latest_seq, count: rows.length });
+  } catch (e: any) {
+    return c.json({ error: "db_error", detail: String(e?.message ?? e) }, 500);
+  }
+});
+
+// ── POST /commands/:id/ack — worker reports done/failed ─────────────────
+app.post("/commands/:id/ack", async (c) => {
+  const url = new URL(c.req.url);
+  if (!checkAuth(c.req.raw, url)) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const id = c.req.param("id");
+  let body: any = {};
+  try { body = await c.req.json(); } catch { /* allow empty body */ }
+  const ack_state = String(body?.ack_state ?? "acked");
+  if (!["acked", "failed"].includes(ack_state)) {
+    return c.json({ error: "invalid_ack_state" }, 400);
+  }
+  const ack_session_id = String(body?.ack_session_id ?? "unknown");
+  const ack_ts = new Date().toISOString();
+  const ack_payload_json = JSON.stringify(body?.ack_payload ?? {});
+
+  try {
+    const result = q.ackCommand.run({ command_id: id, ack_state, ack_session_id, ack_ts, ack_payload_json });
+    if (result.changes === 0) {
+      return c.json({ error: "not_found_or_already_acked" }, 404);
+    }
+    return c.json({ ok: true, command_id: id, ack_state, ack_ts });
+  } catch (e: any) {
+    return c.json({ error: "db_error", detail: String(e?.message ?? e) }, 500);
+  }
+});
+
 // ── GET /sessions ────────────────────────────────────────────────────────
 app.get("/sessions", (c) => {
   const url = new URL(c.req.url);
   const pool = url.searchParams.get("pool") ?? "";
   const tag = url.searchParams.get("tag") ?? "";
   const since = url.searchParams.get("since") ?? "";
-  const limit = Math.min(parseInt(url.searchParams.get("limit") ?? "50", 10), 200);
+  // G4 fix (audit 2026-07-06): Number.isFinite guards so ?limit=foo returns 200 with default 50, not 500.
+  const rawLimit = parseInt(url.searchParams.get("limit") ?? "50", 10);
+  const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 200) : 50;
 
   try {
     const rows = q.listSessions.all({
@@ -366,9 +499,13 @@ app.get("/sessions", (c) => {
 app.get("/sessions/:id/events", (c) => {
   const sid = c.req.param("id");
   const url = new URL(c.req.url);
-  const limit = Math.min(parseInt(url.searchParams.get("limit") ?? "200", 10), 1000);
-  const beforeSeq = url.searchParams.get("before_seq");
-  const sinceSeq = url.searchParams.get("since_seq");
+  // G4 / T8: guard NaN and out-of-range on every numeric query param.
+  const rawLimit = parseInt(url.searchParams.get("limit") ?? "200", 10);
+  const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 1000) : 200;
+  const beforeSeqRaw = parseInt(url.searchParams.get("before_seq") ?? "", 10);
+  const beforeSeq = Number.isFinite(beforeSeqRaw) ? beforeSeqRaw : null;
+  const sinceSeqRaw = parseInt(url.searchParams.get("since_seq") ?? "", 10);
+  const sinceSeq = Number.isFinite(sinceSeqRaw) ? sinceSeqRaw : null;
   const type = url.searchParams.get("type") ?? "";
 
   try {
@@ -376,7 +513,7 @@ app.get("/sessions/:id/events", (c) => {
       const rows = q.getSessionEventsSince.all({
         session_id: sid,
         limit,
-        since_seq: parseInt(sinceSeq, 10),
+        since_seq: sinceSeq,
         type,
       }) as any[];
       return c.json({ events: rows.map(rowToEvent) });
@@ -385,7 +522,7 @@ app.get("/sessions/:id/events", (c) => {
     const rows = q.getSessionEvents.all({
       session_id: sid,
       limit,
-      before_seq: beforeSeq ? parseInt(beforeSeq, 10) : null,
+      before_seq: beforeSeq,
       type,
     }) as any[];
 
