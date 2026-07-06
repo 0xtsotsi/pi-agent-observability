@@ -45,12 +45,16 @@ export interface ReplayHandle {
   queue: EventQueue;
 }
 
+function argString(v: string | boolean | undefined, fallback = ""): string {
+  return typeof v === "string" ? v : fallback;
+}
+
 export function configFromEnvAndArgs(argv: string[]): ReplayConfig {
   const args = parseArgs(argv);
   return {
-    serverUrl: args["server-url"] ?? process.env.OBS_SERVER_URL ?? "http://127.0.0.1:43190",
-    token: args.token ?? process.env.OBS_AUTH_TOKEN ?? "",
-    watchDir: args["watch-dir"] ?? process.env.OBS_WATCH_DIR ?? path.join(os.homedir(), ".gg", "sessions"),
+    serverUrl: argString(args["server-url"], process.env.OBS_SERVER_URL ?? "http://127.0.0.1:43190"),
+    token: argString(args.token, process.env.OBS_AUTH_TOKEN ?? ""),
+    watchDir: argString(args["watch-dir"], process.env.OBS_WATCH_DIR ?? path.join(os.homedir(), ".gg", "sessions")),
     quiet: args.quiet === true || process.env.OBS_QUIET === "1",
     backfillOnStart: process.env.OBS_BACKFILL !== "0",
   };

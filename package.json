@@ -8,7 +8,8 @@
   "scripts": {
     "dev": "tsx watch server/server.ts",
     "start": "tsx server/server.ts",
-    "replay": "tsx daemon/replay-cli.ts"
+    "replay": "tsx daemon/replay-cli.ts",
+    "test": "vitest run"
   },
   "dependencies": {
     "@hono/node-server": "^1.13.7",
@@ -20,7 +21,8 @@
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.10.5",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.3"
+    "typescript": "^5.7.3",
+    "vitest": "^4.1.10"
   },
   "engines": {
     "npm": "please-use-yarn"
