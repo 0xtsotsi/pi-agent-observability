@@ -389,20 +389,13 @@ app.get("/events", (c) => {
 
   try {
     // Aggregate query: walk events newer than `since` across all sessions, post-filter.
-    // We use the existing q.getSessionEventsSince one event at a time
-    // by walking backwards from the most recent seq. This is O(N) per
-    // request and not great at scale, but sufficient for the worker observability
-    // path where event volume is low. A future optimization is to add a
-    // session-agnostic prepared statement (deferred).
+    // We use q.getSessionEventsSince one event at a time by walking backwards from
+    // the most recent seq. This is O(N) per request and not great at scale, but
+    // sufficient for the worker observability path where event volume is low. A
+    // future optimization is to add a session-agnostic prepared statement (deferred).
     //
-    // (Removed in PR #1 follow-up: the empty-session_id dummy query above
-    //  matched nothing and was being computed + discarded — wasteful. Now
-    //  we go straight to the maxSeq probe.)
-    // We use the existing q.getSessionEventsSince one event at a time
-    // by walking backwards from the most recent seq. This is O(N) per
-    // request and not great at scale, but sufficient for the worker observability
-    // path where event volume is low. A future optimization is to add a
-    // session-agnostic prepared statement (deferred).
+    // PR #1 follow-up: removed an empty-session_id dummy query that computed +
+    // discarded a result; now goes straight to the maxSeq probe below.
     const maxSeq = (q.getSessionEventsSince.all({
       session_id: "_nonempty_",  // arbitrary non-empty to get the latest events
       since_seq: 0,
