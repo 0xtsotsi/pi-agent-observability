@@ -8,14 +8,13 @@
 const STATE = window.__OBS_STATE;
 const O = window.OBS;
 const {
-  summaryFor, summaryClass, renderDetailHTML, fmtTs, trunc, shortId,
+  summaryFor, summaryClass, fmtTs, trunc, shortId,
   fetchSessionEvents, renderSessions, apiUrl, authHeaders, fmtRel, fmtTokens,
   saveURLState, escapeHtml, toolNamePillHTML
 } = O;
 
 const TRACKS = new Map();
 let autoAddRaceTracks = true;
-let raceSSEResynced = false;
 let openEventId = null;
 
 const raceContainer = document.getElementById("race-container");
@@ -70,8 +69,7 @@ window.__raceOnSessions = function() {
 };
 
 window.__raceOnReconnect = function() {
-  raceSSEResynced = false;
-  resyncAllTracks().then(() => { raceSSEResynced = true; });
+  resyncAllTracks();
 };
 
 window.__raceOnEvent = function(evt) { routeSSEEvent(evt); };
@@ -124,7 +122,7 @@ function createTrack(sid) {
 
   const stats = STATE.sessionStats[sid];
   const costStr = stats ? `$${stats.total_cost.toFixed(4)} · ${fmtTokens(stats.total_tokens)} tk` : "";
-  TRACKS.set(sid, { session: sess, events: [], lastSeq: -1, el, costStr, activeGroupKey: null });
+  TRACKS.set(sid, { session: sess, events: [], lastSeq: -1, el, costStr, activeGroupKey: null, loadToken: 0 });
   updateEmpty();
   loadTrackEvents(sid);
 }
@@ -142,8 +140,14 @@ function destroyTrack(sid) {
 async function loadTrackEvents(sid) {
   const track = TRACKS.get(sid);
   if (!track) return;
+  // Increment loadToken synchronously (before any await) so any concurrent
+  // loadTrackEvents call invalidates our snapshot. If a newer load started
+  // while we were awaiting, our resync is stale and we must NOT clobber
+  // track.events with the server's older snapshot — that would wipe any
+  // SSE-appended rows that routeSSEEvent pushed during the await.
+  const myToken = ++track.loadToken;
   const events = await fetchSessionEvents(sid);
-  if (!TRACKS.has(sid)) return;
+  if (!TRACKS.has(sid) || track.loadToken !== myToken) return;
   track.events = events || [];
   track.lastSeq = track.events.length ? track.events[track.events.length - 1].seq : -1;
   renderTrack(sid);

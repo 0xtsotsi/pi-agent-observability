@@ -10,7 +10,6 @@ const { summaryFor, summaryClass, renderDetailHTML, fmtTs, trunc, shortId, fetch
 
 const LANES = new Map();
 let autoAddLanes = true;
-let swimlaneSSEResynced = false;
 
 // ─── Live-event pulse styling ───────────────────────────────────────────────
 // Each SSE-arrived row gets `.evt-new` for a one-shot slide-in + background
@@ -63,8 +62,7 @@ window.__swimlaneOnSessions = function() {
 };
 
 window.__swimlaneOnReconnect = function() {
-  swimlaneSSEResynced = false;
-  resyncAllLanes().then(() => { swimlaneSSEResynced = true; });
+  resyncAllLanes();
 };
 
 window.__swimlaneOnEvent = function(evt) { routeSSEEvent(evt); };
@@ -132,7 +130,7 @@ function createLane(sid) {
   header.innerHTML = `
     <span class="lane-dot off" id="lane-dot-${sid}"></span>
     <span class="lane-name" title="${escapeHtml(name)}">${escapeHtml(name)}</span>
-    <span class="lane-model">${sess?.model ?? ""}</span>
+    <span class="lane-model">${escapeHtml(sess?.model ?? "")}</span>
     <span class="lane-cost" id="lane-cost-${sid}">${costStr}</span>
     <span id="lane-age-${sid}" style="color:var(--muted);font-size:8px;margin-left:auto;"></span>
     <button class="lane-close" title="Close lane" onclick="event.stopPropagation();window.__swimlaneToggle('${sid}')">×</button>
@@ -189,7 +187,7 @@ function createLane(sid) {
   });
   observer.observe(content, { childList: true });
 
-  LANES.set(sid, { session: sess, events: [], lastSeq: -1, paused: false, stickToBottom: true, autoScrolling: false, col, body, content, observer, costStr: costStr });
+  LANES.set(sid, { session: sess, events: [], lastSeq: -1, paused: false, stickToBottom: true, autoScrolling: false, col, body, content, observer, costStr: costStr, loadToken: 0 });
 
   loadLaneEvents(sid);
   updateLaneAge(sid);
@@ -208,7 +206,14 @@ function destroyLane(sid) {
 async function loadLaneEvents(sid) {
   const lane = LANES.get(sid);
   if (!lane) return;
+  // Increment loadToken synchronously (before any await) so any concurrent
+  // loadLaneEvents call invalidates our snapshot. If a newer load started
+  // while we were awaiting, our resync is stale and we must NOT clobber
+  // lane.events with the server's older snapshot — that would wipe any
+  // SSE-appended rows that routeSSEEvent pushed during the await.
+  const myToken = ++lane.loadToken;
   const events = await fetchSessionEvents(sid);
+  if (!LANES.has(sid) || lane.loadToken !== myToken) return;
   if (events?.length) {
     lane.events = events;
     lane.lastSeq = events[events.length - 1].seq;
@@ -268,7 +273,7 @@ function appendLaneDOM(sid, evt, isLive = false) {
 
   const row = document.createElement("div");
   row.className = "lane-evt";
-  row.innerHTML = `<span class="lane-evt-ts">${fmtTs(evt.ts)}</span><span class="lane-evt-type"><span class="pill ${evt.type}">${evt.type.replace(/_/g," ")}</span>${toolNamePillHTML(evt)}</span><span class="lane-evt-summary ${summaryClass(evt)}">${summaryFor(evt)}</span>`;
+  row.innerHTML = `<span class="lane-evt-ts">${fmtTs(evt.ts)}</span><span class="lane-evt-type"><span class="pill ${evt.type}">${evt.type.replace(/_/g," ")}</span>${toolNamePillHTML(evt)}</span><span class="lane-evt-summary ${summaryClass(evt)}">${escapeHtml(summaryFor(evt))}</span>`;
 
   if (isLive) {
     row.style.setProperty("--pulse-color", pulseColorFor(evt.type));

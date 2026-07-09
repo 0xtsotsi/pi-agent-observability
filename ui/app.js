@@ -4,12 +4,64 @@
  */
 (function() {
 
-// ─── State ──────────────────────────────────────────────────────────────────
+// ─── Token persistence ────────────────────────────────────────────────────────
+// V3 security constraint: the token only travels in the query string (?token=…),
+// never in the URL fragment/hash, so shareable view-state URLs are safe to copy.
+// localStorage shim: on first load with ?token=, persist it. On subsequent loads
+// without ?token=, restore from localStorage so the UI rehydrates without manual
+// re-entry. localStorage is per-origin and never leaves the browser.
+
+const TOKEN_STORAGE_KEY = "gg-obs-token-v1";
+
+function loadStoredToken() {
+  try {
+    return localStorage.getItem(TOKEN_STORAGE_KEY) ?? "";
+  } catch {
+    // localStorage may throw in private/restricted contexts (file://, sandboxed
+    // iframes). Fail closed — empty token means UI shows no data, which is safer
+    // than leaking.
+    return "";
+  }
+}
+
+function persistToken(t) {
+  if (!t) return;
+  try {
+    localStorage.setItem(TOKEN_STORAGE_KEY, t);
+  } catch {
+    // ignore — same fail-closed rationale as loadStoredToken.
+  }
+}
+
+function clearStoredToken() {
+  try {
+    localStorage.removeItem(TOKEN_STORAGE_KEY);
+  } catch {
+    // ignore.
+  }
+}
+
+// V3 regression fix: token must come from ?token=… query param. The hash is
+// for shareable view-state only; we don't want the token in shared URLs.
+// localStorage shim restores the token on reload so the user doesn't have to
+// re-enter it. The token never enters the URL fragment/hash — only the query
+// string on first load, and the browser's localStorage after that.
+const urlToken = new URLSearchParams(location.search).get("token") ?? "";
+if (urlToken) {
+  persistToken(urlToken);
+}
+
+// ?logout=1 runs BEFORE STATE init — strip the stored token and redirect to a
+// clean URL (no token, hash preserved for shareable view-state). Must run
+// before any code that reads STATE.token.
+if (new URLSearchParams(location.search).get("logout") === "1") {
+  clearStoredToken();
+  const cleanUrl = location.origin + location.pathname + location.hash;
+  location.replace(cleanUrl);
+}
 
 const STATE = {
-  // V3 regression fix: token must come from ?token=… query param. The hash is
-  // for shareable view-state only; we don't want the token in shared URLs.
-  token: new URLSearchParams(location.search).get("token") ?? "",
+  token: urlToken || loadStoredToken(),
   view: "single", mode: "form", pool: "", tag: "", search: "", sort: "latest", hideAfter: "30m", showHidden: false,
   typeFilter: new Set(), autoScroll: true,
   selectedSessionId: null, sessions: [], events: [], sessionsLoaded: false, hiddenSessions: loadHiddenSessions(),
@@ -18,7 +70,15 @@ const STATE = {
   sseReconnectDelay: 1000, maxReconnectDelay: 10_000,
   renderDirty: true, seenIds: new Set(),
   sessionStats: {}, // sid → {total_cost,total_tokens,error_count}
-  ackd: new Set(),
+  ackd: loadAckdSet(),
+};
+
+// ─── Public token-control surface (for DevTools/automation) ───────────────────
+// window.__ggObsToken.clear() wipes localStorage without a reload — useful
+// when you want to force a re-entry on next load.
+window.__ggObsToken = {
+  clear: clearStoredToken,
+  persist: persistToken,
 };
 
 window.__OBS_STATE = STATE;
@@ -30,15 +90,16 @@ function loadURLState() {
   if (!h) return;
   const p = new URLSearchParams(h);
   if (p.has("view")) STATE.view = p.get("view");
-  if (!["single", "swimlane", "race"].includes(STATE.view)) STATE.view = "single";
+  if (!["single", "swimlane", "race", "workers"].includes(STATE.view)) STATE.view = "single";
   if (p.has("mode")) STATE.mode = p.get("mode");
   else { const stored = localStorage.getItem("obs-mode"); if (stored === "form" || stored === "function") STATE.mode = stored; }
   if (p.has("pool")) { STATE.pool = p.get("pool"); poolFilter.value = STATE.pool; }
   if (p.has("tag")) { STATE.tag = p.get("tag"); tagFilter.value = STATE.tag; }
+  if (p.has("type_prefix")) { STATE.typePrefix = p.get("type_prefix"); if (typePrefixFilter) typePrefixFilter.value = STATE.typePrefix; }
   if (p.has("sort")) { STATE.sort = p.get("sort"); sortSelect.value = STATE.sort; }
   if (p.has("hide_after")) { STATE.hideAfter = p.get("hide_after"); hideAfterSelect.value = STATE.hideAfter; }
   if (p.has("show_hidden")) { STATE.showHidden = p.get("show_hidden") === "1"; showHiddenCB.checked = STATE.showHidden; }
-  if (p.has("sid")) { STATE.selectedSessionId = p.get("sid"); STATE.ackd.add(STATE.selectedSessionId); }
+  if (p.has("sid")) { STATE.selectedSessionId = p.get("sid"); STATE.ackd.add(STATE.selectedSessionId); persistAckdSet(); }
   if (p.has("lanes")) {
     const lanes = p.get("lanes").split(",").filter(Boolean);
     window.__restoreLanes = lanes;
@@ -60,6 +121,7 @@ function saveURLState() {
   if (STATE.mode !== "form") p.set("mode", STATE.mode);
   if (STATE.pool) p.set("pool", STATE.pool);
   if (STATE.tag) p.set("tag", STATE.tag);
+  if (STATE.typePrefix) p.set("type_prefix", STATE.typePrefix);
   if (STATE.sort !== "latest") p.set("sort", STATE.sort);
   if (STATE.hideAfter !== "30m") p.set("hide_after", STATE.hideAfter);
   if (STATE.showHidden) p.set("show_hidden", "1");
@@ -378,15 +440,18 @@ window.setMode = function(mode) {
 };
 
 window.setView = function(mode) {
-  if (!["single", "swimlane", "race"].includes(mode)) mode = "single";
+  if (!["single", "swimlane", "race", "workers"].includes(mode)) mode = "single";
   STATE.view = mode;
   localStorage.setItem("obs-view", mode);
   $("#btn-single").classList.toggle("active", mode === "single");
   $("#btn-swimlane").classList.toggle("active", mode === "swimlane");
   $("#btn-race")?.classList.toggle("active", mode === "race");
+  $("#btn-workers")?.classList.toggle("active", mode === "workers");
   singlePane.style.display = mode === "single" ? "" : "none";
   swimlaneContainer.classList.toggle("active", mode === "swimlane");
   raceContainer?.classList.toggle("active", mode === "race");
+  const workersPane = document.getElementById("workers-pane");
+  if (workersPane) workersPane.classList.toggle("active", mode === "workers");
   if (mode !== "race") window.__raceCloseInspector?.();
   if (sessionSubnav) sessionSubnav.style.display = (mode === "single" && STATE.selectedSessionId) ? "flex" : "none";
   autoAddRow.style.display = mode === "swimlane" || mode === "race" ? "" : "none";
@@ -408,6 +473,10 @@ window.setView = function(mode) {
     loadSession(STATE.selectedSessionId);
   } else if (mode === "single") {
     setSingleSessionControlsVisible(false);
+  }
+  if (mode === "workers") {
+    // Re-render the dashboard with current state immediately.
+    window.__workersRender?.();
   }
   saveURLState();
 };
@@ -570,7 +639,7 @@ function renderSessions() {
 
     const info = document.createElement("div");
     info.className = "info";
-    info.innerHTML = `<div class="name">${escapeHtml(name)}${errDotHtml}${hiddenNote}</div><div class="uuid">${shortId}${s.model ? " · " + s.model : ""}</div><div class="meta">${s.pool} · ${s.event_count} events · ${relTime}</div>${costStr ? `<div class="cost">${costStr}</div>` : ""}`;
+    info.innerHTML = `<div class="name">${escapeHtml(name)}${errDotHtml}${hiddenNote}</div><div class="uuid">${shortId}${s.model ? " · " + escapeHtml(s.model) : ""}</div><div class="meta">${escapeHtml(s.pool)} · ${escapeHtml(s.event_count)} events · ${escapeHtml(relTime)}</div>${costStr ? `<div class="cost">${escapeHtml(costStr)}</div>` : ""}`;
 
     if (STATE.view === "single") {
       el.addEventListener("click", () => selectSession(s.session_id));
@@ -662,9 +731,17 @@ function selectSession(sid) {
 async function loadSession(sid) {
   const s = STATE.sessions.find(x => x.session_id === sid);
   paneLabel.textContent = s ? (s.agent_name ?? s.cwd?.split("/").pop() ?? shortId(sid)) : shortId(sid);
-  const events = await fetchSessionEvents(sid);
+  const result = await fetchSessionEventsPaged(sid);
   if (STATE.selectedSessionId !== sid) return;
-  STATE.events = events || [];
+  STATE.events = result.events || [];
+  // Heuristic truncation detection: the server returns just { events } with no
+  // total/truncated field, so we assume truncation is possible whenever the
+  // page is full. earliestSeq is used by the "load earlier" affordance.
+  STATE.truncation = {
+    truncated: result.truncated,
+    earliestSeq: result.earliestSeq,
+    limit: result.limit,
+  };
   STATE.renderDirty = true;
   for (const e of STATE.events) STATE.seenIds.add(e.event_id);
   renderAllEvents();
@@ -674,6 +751,8 @@ async function loadSession(sid) {
   renderAgentSubnav();
 }
 
+// Legacy fetchSessionEvents — kept for swimlane.js / race.js which expect
+// an array back and pass a raw seq as the 2nd arg (treated as since_seq).
 async function fetchSessionEvents(sid, sinceSeq) {
   try {
     const params = { limit: 1000 };
@@ -684,6 +763,56 @@ async function fetchSessionEvents(sid, sinceSeq) {
     const data = await res.json();
     return data.events ?? [];
   } catch { return []; }
+}
+
+// Paged variant used by the timeline UI. Returns { events, truncated,
+// earliestSeq, limit }. `truncated` is a heuristic: true if the server
+// returned exactly `limit` events. The server does not currently expose
+// a total/hasMore field.
+async function fetchSessionEventsPaged(sid, { beforeSeq, limit = 1000 } = {}) {
+  try {
+    const params = { limit };
+    if (beforeSeq !== undefined) params.before_seq = beforeSeq;
+    const url = apiUrl(`/sessions/${sid}/events`, params);
+    const res = await fetch(url, { headers: authHeaders() });
+    if (!res.ok) return { events: [], truncated: false, earliestSeq: null, limit };
+    const data = await res.json();
+    const events = data.events ?? [];
+    const earliestSeq = events.length ? events[0].seq : null;
+    return { events, truncated: events.length >= limit, earliestSeq, limit };
+  } catch {
+    return { events: [], truncated: false, earliestSeq: null, limit };
+  }
+}
+
+// Prepends earlier events to STATE.events when the user clicks the
+// truncation-notice "load earlier" button. Idempotent against re-clicks.
+async function loadEarlierEvents() {
+  const sid = STATE.selectedSessionId;
+  if (!sid || !STATE.truncation?.truncated || STATE.loadingEarlier) return;
+  const beforeSeq = STATE.truncation.earliestSeq;
+  if (beforeSeq == null) return;
+  STATE.loadingEarlier = true;
+  try {
+    const result = await fetchSessionEventsPaged(sid, { beforeSeq, limit: STATE.truncation.limit ?? 1000 });
+    if (STATE.selectedSessionId !== sid) return; // user switched sessions
+    const existing = new Set(STATE.events.map(e => e.event_id));
+    const incoming = (result.events || []).filter(e => !existing.has(e.event_id));
+    if (!incoming.length) {
+      // Nothing new — the heuristic was wrong (we already had everything).
+      STATE.truncation.truncated = false;
+      renderAllEvents();
+      return;
+    }
+    STATE.events = [...incoming, ...STATE.events];
+    for (const e of incoming) STATE.seenIds.add(e.event_id);
+    STATE.truncation.earliestSeq = incoming[0].seq;
+    STATE.truncation.truncated = result.truncated; // may still be true if another full page remains
+    STATE.renderDirty = true;
+    renderAllEvents();
+  } finally {
+    STATE.loadingEarlier = false;
+  }
 }
 
 // ─── Event rendering (single mode, append-only) ────────────────────────────
@@ -703,7 +832,11 @@ function renderAllEvents() {
   const evts = getFilteredEvents();
   if (!evts.length) {
     eventView.innerHTML = '<div class="empty-state" style="font-size:12px">no matching events</div>';
+    STATE.renderDirty = false;
     return;
+  }
+  if (STATE.truncation?.truncated) {
+    eventView.appendChild(buildTruncationNotice(STATE.truncation));
   }
   for (let i = 0; i < evts.length; i++) {
     eventView.appendChild(buildEventRow(evts[i], i));
@@ -711,6 +844,20 @@ function renderAllEvents() {
   if (STATE.autoScroll) scrollEventViewToBottom();
   STATE.renderDirty = false;
   updateAgeTicker();
+}
+
+function buildTruncationNotice(t) {
+  const wrap = document.createElement("div");
+  wrap.className = "truncation-notice";
+  wrap.innerHTML = `<span>Showing latest ${t.limit ?? 1000} events — earlier events may be truncated.</span>`;
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "btn-sm";
+  btn.textContent = STATE.loadingEarlier ? "loading…" : "load earlier";
+  btn.disabled = !!STATE.loadingEarlier;
+  btn.addEventListener("click", () => { loadEarlierEvents(); });
+  wrap.appendChild(btn);
+  return wrap;
 }
 
 function appendEventSingle(evt) {
@@ -746,7 +893,7 @@ function buildEventRow(evt, idx, isLive = false) {
   const row = document.createElement("div");
   row.className = "evt-row" + (idx === STATE.focusedIdx ? " focused" : "");
   row.dataset.idx = idx;
-  row.innerHTML = `<span class="evt-ts">${fmtTs(evt.ts)}</span><span class="evt-type"><span class="pill ${evt.type}">${evt.type.replace(/_/g," ")}</span>${toolNamePillHTML(evt)}</span><span class="evt-summary ${summaryClass(evt)}">${summaryFor(evt)}</span>`;
+  row.innerHTML = `<span class="evt-ts">${fmtTs(evt.ts)}</span><span class="evt-type"><span class="pill ${evt.type}">${evt.type.replace(/_/g," ")}</span>${toolNamePillHTML(evt)}</span><span class="evt-summary ${summaryClass(evt)}">${escapeHtml(summaryFor(evt))}</span>`;
 
   if (isLive && typeof window.__pulseColorFor === "function") {
     row.style.setProperty("--pulse-color", window.__pulseColorFor(evt.type));
@@ -859,7 +1006,13 @@ document.addEventListener("keydown", (e) => {
       STATE.focusedIdx = Math.max(STATE.focusedIdx - 1, 0);
       refreshFocus(); scrollToFocused(); break;
     case "Enter": case " ": e.preventDefault(); toggleFocusedDetail(); break;
-    case "Escape": e.preventDefault(); collapseAll(); break;
+    case "Escape":
+      if (helpOverlay.classList.contains("show")) {
+        e.preventDefault();
+        helpOverlay.classList.remove("show");
+        return;
+      }
+      e.preventDefault(); collapseAll(); break;
     case "g": e.preventDefault(); STATE.focusedIdx = 0; refreshFocus(); scrollToFocused(); break;
     case "G": e.preventDefault(); STATE.focusedIdx = evts.length - 1; refreshFocus(); scrollToFocused(); break;
   }
@@ -962,10 +1115,37 @@ function updateSSEFilter() {
   connectSSE();
 }
 
+/**
+ * Step 4 fix (sse-sync): on reconnect, fetch events that arrived during the
+ * disconnect window via GET /events?since=<lastSeq> and re-feed them through
+ * the active view's append handler. Without this, every reconnect causes a
+ * silent gap in the live view.
+ */
+let __sseLastSeq = 0;
+async function replayMissedEvents() {
+  if (!__sseLastSeq) return;
+  try {
+    const url = apiUrl("/events", { since: __sseLastSeq, limit: 200 });
+    const res = await fetch(url, { headers: authHeaders() });
+    if (!res.ok) return;
+    const data = await res.json();
+    for (const evt of data.events ?? []) {
+      if (typeof evt.type === "string" && (evt.type.startsWith("worker.") || evt.type.startsWith("bus."))) {
+        window.__workersOnEvent?.(evt);
+      }
+      if (STATE.view === "single" && STATE.selectedSessionId) appendEventSingle(evt);
+      else if (STATE.view === "swimlane") window.__swimlaneOnEvent?.(evt);
+      else if (STATE.view === "race") window.__raceOnEvent?.(evt);
+      if (typeof evt.seq === "number" && evt.seq > __sseLastSeq) __sseLastSeq = evt.seq;
+    }
+  } catch { /* best-effort */ }
+}
+
 function connectSSE() {
   const params = {};
   if (STATE.pool) params.pool = STATE.pool;
   if (STATE.tag) params.tag = STATE.tag;
+  if (STATE.typePrefix) params.tag = STATE.typePrefix; // type-prefix piggybacks on tag (server LIKE substring)
   if (STATE.view === "single" && STATE.selectedSessionId) params.session_id = STATE.selectedSessionId;
   if (STATE.token) params.token = STATE.token;
   const url = apiUrl("/events/stream", params);
@@ -974,6 +1154,8 @@ function connectSSE() {
   es.addEventListener("hello", () => {
     setLive(true);
     STATE.sseReconnectDelay = 1000;
+    // Step 4 fix (sse-sync): replay events missed during disconnect.
+    void replayMissedEvents();
     if (STATE.view === "swimlane") window.__swimlaneOnReconnect?.();
     if (STATE.view === "race") window.__raceOnReconnect?.();
   });
@@ -981,6 +1163,12 @@ function connectSSE() {
     try {
       const evt = JSON.parse(msg.data);
       if (!evt?.event_id) return;
+      // Step 3 (sse-sync): worker.* and bus.* events fan out to the dashboard
+      // regardless of current view, so the tile state stays current when the
+      // user opens the Workers tab after the events already arrived.
+      if (typeof evt.type === "string" && (evt.type.startsWith("worker.") || evt.type.startsWith("bus."))) {
+        window.__workersOnEvent?.(evt);
+      }
       if (STATE.view === "single") appendEventSingle(evt);
       else if (STATE.view === "swimlane") window.__swimlaneOnEvent?.(evt);
       else if (STATE.view === "race") window.__raceOnEvent?.(evt);
@@ -1042,6 +1230,21 @@ window.autoAddLanes = () => autoAddCB.checked;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
+// Step 4 fix (sse-sync): ackd persists across reloads so the sidebar's red
+// error dot stays dim after a refresh.
+const _ACKD_KEY = "gg-obs-ackd-v1";
+function loadAckdSet() {
+  try {
+    const raw = localStorage.getItem(_ACKD_KEY);
+    if (!raw) return new Set();
+    const arr = JSON.parse(raw);
+    return new Set(Array.isArray(arr) ? arr : []);
+  } catch { return new Set(); }
+}
+function persistAckdSet() {
+  try { localStorage.setItem(_ACKD_KEY, JSON.stringify([...STATE.ackd])); } catch { /* ignore */ }
+}
+
 function loadHiddenSessions() {
   try {
     const parsed = JSON.parse(localStorage.getItem("obs-hidden-sessions") || "[]");
@@ -1075,7 +1278,9 @@ function fmtTs(ts) {
 }
 function fmtRel(ts) {
   if (!ts) return "";
-  const s = Math.round((Date.now() - new Date(ts).getTime()) / 1000);
+  const t = new Date(ts).getTime();
+  if (Number.isNaN(t)) return "—";
+  const s = Math.round((Date.now() - t) / 1000);
   if (s < 60) return s <= 0 ? "now" : `${s}s ago`;
   if (s < 3600) return `${Math.floor(s/60)}m ago`;
   return `${Math.floor(s/3600)}h ago`;
