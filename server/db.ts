@@ -81,6 +81,7 @@ export interface PreparedQueries {
   listSessions: Database.Statement;
   getSessionEvents: Database.Statement;
   getSessionEventsSince: Database.Statement;
+  listAllEvents: Database.Statement; // generic GET /events?type=&provider=&tag=&since=
   getSessionStats: Database.Statement;
   getSessionContext: Database.Statement;
   countTotals: Database.Statement;
@@ -220,6 +221,21 @@ export function prepare(db: Database.Database): PreparedQueries {
     LIMIT @limit
   `);
 
+  // ── List all events (no session filter) for GET /events ──────────────
+  // Empty @type or @provider means no filter on that field. @since_seq defaults
+  // to 0 (no lower bound). @tag filters on tags_json LIKE (substring match).
+  const listAllEvents = db.prepare(`
+    SELECT
+      event_id, session_id, seq, ts, type, pool, tags_json, payload_json, provider, model, cwd, session_file, agent_name
+    FROM events
+    WHERE (@type = '' OR type LIKE @type)
+      AND (@provider = '' OR provider = @provider)
+      AND (@tag = '' OR tags_json LIKE @tag)
+      AND (@since_seq = 0 OR seq > @since_seq)
+    ORDER BY seq DESC
+    LIMIT @limit
+  `);
+
   // ── Session stats (cost, tokens, errors) ──────────────────────────────
   const getSessionStats = db.prepare(`
     SELECT
@@ -304,6 +320,7 @@ export function prepare(db: Database.Database): PreparedQueries {
     listSessions,
     getSessionEvents,
     getSessionEventsSince,
+    listAllEvents,
     getSessionStats,
     getSessionContext,
     countTotals,

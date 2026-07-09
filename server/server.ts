@@ -27,8 +27,8 @@ import type { ObsEvent } from "../shared/types.js";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
-const PORT = parseInt(process.env.OBS_PORT ?? "43190", 10);
-const HOST = process.env.OBS_HOST ?? "127.0.0.1";
+const PORT = parseInt(process.env["OBS_PORT"] ?? "43190", 10);
+const HOST = process.env["OBS_HOST"] ?? "127.0.0.1";
 
 // Default DB location: ~/.gg/observability/obs.db (per-user, persistent).
 // Override with OBS_DB_PATH for tests or alternative storage.
@@ -37,12 +37,12 @@ function defaultDbPath(): string {
   return path.join(home, ".gg", "observability", "obs.db");
 }
 
-const DB_PATH = process.env.OBS_DB_PATH ?? defaultDbPath();
+const DB_PATH = process.env["OBS_DB_PATH"] ?? defaultDbPath();
 
 // Ensure parent folder exists before initializing SQLite.
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 
-const AUTH_TOKEN = process.env.OBS_AUTH_TOKEN ?? crypto.randomUUID();
+const AUTH_TOKEN = process.env["OBS_AUTH_TOKEN"] ?? crypto.randomUUID();
 const VERSION = "0.1.0";
 
 // Persist the token to a file the helper reads, so server restarts and the
@@ -80,9 +80,9 @@ console.log(`  UI dir: ${UI_DIR}\n`);
 interface SSESubscriber {
   id: number;
   controller: { enqueue: (chunk: Uint8Array) => void };
-  pool?: string;
-  tag?: string;
-  session_id?: string;
+  pool?: string | undefined;
+  tag?: string | undefined;
+  session_id?: string | undefined;
 }
 
 let nextSubId = 1;
@@ -190,8 +190,8 @@ function checkAuth(req: Request, url: URL): boolean {
     const parts = auth.split(" ");
     if (
       parts.length === 2 &&
-      parts[0].toLowerCase() === "bearer" &&
-      parts[1] === AUTH_TOKEN
+      parts[0]!.toLowerCase() === "bearer" &&
+      parts[1]! === AUTH_TOKEN
     ) {
       return true;
     }
@@ -306,6 +306,7 @@ app.get("/index.html", (c) => {
 app.get("/app.js", (c) => serveStatic("app.js") ?? c.text("not found", 404));
 app.get("/race.js", (c) => serveStatic("race.js") ?? c.text("not found", 404));
 app.get("/swimlane.js", (c) => serveStatic("swimlane.js") ?? c.text("not found", 404));
+app.get("/worker-dashboard.js", (c) => serveStatic("worker-dashboard.js") ?? c.text("not found", 404));
 app.get("/logo.svg", (c) => serveStatic("logo.svg") ?? c.text("not found", 404));
 
 // ── Auth wall middleware for everything below ────────────────────────────
@@ -369,6 +370,107 @@ app.post("/events", async (c) => {
   return c.json({ ingested: ingested.length, rejected });
 });
 
+// ── GET /events?type=&provider=&tag=&limit=&since= ────────────────────────
+// Generic events query, used by the worker-daemon observability path.
+// Filters: type (LIKE-prefix), provider (exact), tag (LIKE substring on tags_json),
+// since (event.seq > since). Auth-required, returns the most recent matching events
+// newest-first.
+app.get("/events", (c) => {
+  const url = new URL(c.req.url);
+  if (!checkAuth(c.req.raw, url)) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const typeLike = url.searchParams.get("type") ?? "";
+  const provider = url.searchParams.get("provider") ?? "";
+  const tagLike = url.searchParams.get("tag") ?? "";
+  const since = parseInt(url.searchParams.get("since") ?? "0", 10) || 0;
+  const rawLimit = parseInt(url.searchParams.get("limit") ?? "200", 10);
+  const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 1000) : 200;
+
+  try {
+    // We use the existing getSessionEventsSince (single-session, since_seq)
+    // but pass an empty session_id filter and rely on the SQL's
+    // (session_id = @session_id) check matching nothing — that returns
+    // zero rows. To get all events, we walk the events table by recent
+    // sessions instead. Trade-off: simple, no DB schema change, slow at
+    // very high event volume. Acceptable for the worker-daemon observability
+    // path (event volume is low — a few hundred per session per day).
+    const recentSessions = q.getSessionEventsSince.all({
+      session_id: "",
+      since_seq: 0,
+      type: "",
+      limit: 1, // dummy, not used because session_id='' matches nothing
+    }) as any[]; // unused
+    void recentSessions;
+
+    // Fallback: iterate all events newer than the since param, post-filter.
+    // We use the existing q.getSessionEventsSince one event at a time
+    // by walking backwards from the most recent seq. This is O(N) per
+    // request and not great at scale, but sufficient for the worker observability
+    // path where event volume is low. A future optimization is to add a
+    // session-agnostic prepared statement (deferred).
+    const maxSeq = (q.getSessionEventsSince.all({
+      session_id: "_nonempty_",  // arbitrary non-empty to get the latest events
+      since_seq: 0,
+      type: "",
+      limit: 1,
+    }) as any[])[0]?.seq ?? 0;
+
+    // Walk back from maxSeq collecting events matching our filter.
+    const collected: any[] = [];
+    let cursor = maxSeq + 1;
+    while (collected.length < limit && cursor > since) {
+      // session_id filter: we can't use "" (matches nothing) and we can't
+      // use "%" (LIKE wildcards aren't in the SQL). So we use a sentinel
+      // session we know doesn't exist, and post-filter by sequence range.
+      // Practically: we pull one batch via session_id="_unbound_" which
+      // is a sentinel, the query returns 0 rows, we then pull the next
+      // batch by session_id="_unbound_2" etc. -- but that's silly.
+      //
+      // The simplest correct approach: use a raw SQL via db.prepare.
+      // We do that in db.ts as `listAllEvents`. If it's missing (e.g. older
+      // server build), fall back to a per-session walk.
+      break; // placeholder — actual implementation uses listAllEvents if present
+    }
+    void cursor;
+
+    // The right answer: use the prepared statement. If the file is at
+    // the right rev, listAllEvents is defined and this works. If the
+    // prepared statement isn't registered, fall back to a session walk.
+    if (typeof (q as any).listAllEvents?.all === "function") {
+      const rows = (q as any).listAllEvents.all({
+        type: typeLike ? `${typeLike}%` : "",
+        provider,
+        tag: tagLike ? `%${tagLike}%` : "",
+        since_seq: since,
+        limit,
+      }) as any[];
+      return c.json({ events: rows, count: rows.length });
+    }
+
+    // Fallback: raw SQL via the db handle if listAllEvents isn't registered.
+    const rawRows = (db as any).prepare(`
+      SELECT event_id, session_id, seq, ts, type, pool, tags_json, payload_json, provider, model, cwd, session_file, agent_name
+      FROM events
+      WHERE (@type = '' OR type LIKE @type)
+        AND (@provider = '' OR provider = @provider)
+        AND (@tag = '' OR tags_json LIKE @tag)
+        AND (@since_seq = 0 OR seq > @since_seq)
+      ORDER BY seq DESC
+      LIMIT @limit
+    `).all({
+      type: typeLike ? `${typeLike}%` : "",
+      provider,
+      tag: tagLike ? `%${tagLike}%` : "",
+      since_seq: since,
+      limit,
+    }) as any[];
+    return c.json({ events: rawRows, count: rawRows.length });
+  } catch (e: unknown) {
+    return c.json({ error: "db_error", detail: e instanceof Error ? e.message : String(e) }, 500);
+  }
+});
+
 // ── POST /commands — overlord dispatches a task to a worker ──────────────
 app.post("/commands", async (c) => {
   const url = new URL(c.req.url);
@@ -407,6 +509,30 @@ app.post("/commands", async (c) => {
   } catch (e: any) {
     return c.json({ error: "insert_failed", detail: String(e?.message ?? e) }, 500);
   }
+
+  // Step 2 (sse-sync): broadcast bus.command_created so SSE subscribers see
+  // new dispatches live. Routed via ingestEvent so the event also lands in
+  // the events table for /events?type=bus. history support.
+  ingestEvent({
+    event_id: `bus-c-${command_id}`,
+    session_id: `bus-${target_agent}`,
+    seq: Date.now(),   // unique-per-event so two acks on different commands don't collide on UNIQUE(session_id, seq)
+    ts: created_ts,
+    type: "bus.command_created",
+    pool: target_pool,
+    tags: ["bus", target_agent],
+    payload: {
+      command_id,
+      target_agent,
+      target_pool,
+      action,
+      created_by,
+      seq,
+      payload_json,
+    },
+    provider: "gg-obs",
+    model: null,
+  } as unknown as ObsEvent);
 
   return c.json({ command_id, seq, created_ts, target_agent, action }, 201);
 });
@@ -461,6 +587,33 @@ app.post("/commands/:id/ack", async (c) => {
     if (result.changes === 0) {
       return c.json({ error: "not_found_or_already_acked" }, 404);
     }
+
+    // Step 2 (sse-sync): broadcast bus.command_acked. Look up the target_agent
+    // from the row so subscribers can route by agent. Tolerate the lookup
+    // failing — broadcast is best-effort.
+    let target_agent_for_tag = "unknown";
+    try {
+      const row = db.prepare("SELECT target_agent FROM commands WHERE command_id = ?").get(id) as { target_agent?: string } | undefined;
+      if (row?.target_agent) target_agent_for_tag = row.target_agent;
+    } catch { /* non-fatal */ }
+    ingestEvent({
+      event_id: `bus-a-${id}-${Date.now()}`,
+      session_id: `bus-${target_agent_for_tag}`,
+      seq: Date.now() + 1, // unique-per-event; +1 to avoid same-ms-collision with a create emitted in the same tick
+      ts: ack_ts,
+      type: "bus.command_acked",
+      pool: "default",
+      tags: ["bus", target_agent_for_tag],
+      payload: {
+        command_id: id,
+        state: ack_state,
+        ack_session_id,
+        ack_ts,
+      },
+      provider: "gg-obs",
+      model: null,
+    } as unknown as ObsEvent);
+
     return c.json({ ok: true, command_id: id, ack_state, ack_ts });
   } catch (e: any) {
     return c.json({ error: "db_error", detail: String(e?.message ?? e) }, 500);
@@ -590,8 +743,15 @@ app.get("/events/stream", (c) => {
       };
       c.req.raw.signal.addEventListener("abort", abort);
       // stream.onAbort is the Hono SSE-native close hook if available.
-      const onAbort = (stream as unknown as { onAbort?: (fn: () => void) => void }).onAbort;
-      if (typeof onAbort === "function") onAbort(abort);
+      // BUGFIX 2026-07-07: stream.onAbort is an inherited prototype method on
+      // SSEStreamingApi (extends Hono's StreamingApi). Calling it bare —  —
+      // makes  undefined inside the method, throws TypeError, and the
+      // surrounding run() catches + closes the stream. That cut every subscriber
+      // off right after the hello frame, so live events never streamed to the UI.
+      // Bound call keeps  wired to the stream instance, so the callback
+      // actually registers and only fires on real abort.
+      const streamApi = stream as unknown as { onAbort?: (fn: () => void) => void };
+      if (typeof streamApi.onAbort === "function") streamApi.onAbort.call(stream, abort);
     });
 
     removeSubscriber(subId);

@@ -40,9 +40,9 @@ describe("db round-trip", () => {
       seq: 0,
     } as any;
     const row = toRow(evt);
-    expect(row.cwd).toBe("/tmp/proj");
-    expect(row.session_file).toBe("/tmp/proj/.gg/session.jsonl");
-    expect(row.agent_name).toBe("test-agent");
+    expect(row["cwd"]).toBe("/tmp/proj");
+    expect(row["session_file"]).toBe("/tmp/proj/.gg/session.jsonl");
+    expect(row["agent_name"]).toBe("test-agent");
   });
 
   it("T2.b — insertEvent + rowToEvent round-trips cwd / session_file / agent_name", () => {

@@ -14,7 +14,7 @@ function checkAuth(req: { headers: { get(name: string): string | null } }, url: 
   const auth = req.headers.get("authorization");
   if (auth) {
     const parts = auth.split(" ");
-    if (parts.length === 2 && parts[0].toLowerCase() === "bearer" && parts[1] === token) return true;
+    if (parts.length === 2 && parts[0]!.toLowerCase() === "bearer" && parts[1]! === token) return true;
     return false;
   }
   const qToken = url.searchParams.get("token");
