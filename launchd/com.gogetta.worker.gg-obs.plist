@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.gogetta.worker.gg-obs</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/node</string>
+        <string>--require</string>
+        <string>/Users/gogetta/Documents/projects/gg-observability/node_modules/tsx/dist/preflight.cjs</string>
+        <string>--import</string>
+        <string>file:///Users/gogetta/Documents/projects/gg-observability/node_modules/tsx/dist/loader.mjs</string>
+        <string>/Users/gogetta/Documents/projects/gg-observability/worker/worker.ts</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>AGENT</key>
+        <string>gg-obs</string>
+        <key>OBS_BASE_URL</key>
+        <string>http://127.0.0.1:43190</string>
+        <key>OBS_PROVIDER</key>
+        <string>minimax</string>
+        <key>OBS_MODEL</key>
+        <string>MiniMax-M3</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/Users/gogetta/.gg/worker-logs/gg-obs.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/gogetta/.gg/worker-logs/gg-obs.err</string>
+</dict>
+</plist>

@@ -52,3 +52,6 @@ logs/
 deep_docs/
 
 artifacts/
+
+# Husky internal scratch dir (the .husky/ hooks themselves are committed)
+.husky/_/

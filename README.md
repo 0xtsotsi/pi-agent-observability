@@ -4,6 +4,10 @@
 
 <h1 align="center">Pi Observability</h1>
 
+<p align="center">
+  <img src="https://github.com/disler/pi-agent-observability/actions/workflows/ci.yml/badge.svg" alt="CI">
+</p>
+
 > **Stop guessing what your Pi agent is doing. Watch every turn, every tool call, every token, live.**
 > A local observability stack for the [pi coding agent](https://github.com/earendil-works/pi-mono), plus a product-agent demo that proves the telemetry holds up inside a real app workflow.
 
