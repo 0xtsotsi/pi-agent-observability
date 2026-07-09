@@ -98,7 +98,7 @@ describe("mapSession", () => {
   it("T1.c — seq is monotonic starting at 0", () => {
     const file = writeFixture("s3.jsonl", [header, userMsg, assistantMsg, toolMsg]);
     const seqs = [...mapSession(file)].map((e) => e.seq);
-    for (let i = 1; i < seqs.length; i++) expect(seqs[i]).toBe(seqs[i - 1] + 1);
+    for (let i = 1; i < seqs.length; i++) expect(seqs[i]).toBe(seqs[i - 1]! + 1);
     expect(seqs[0]).toBe(0);
   });
 
@@ -109,8 +109,8 @@ describe("mapSession", () => {
     const turnEnds = events.filter((e) => e.type === "turn_end");
     expect(turnStarts).toHaveLength(1);
     expect(turnEnds).toHaveLength(1);
-    expect((turnStarts[0].payload as any).turn_index).toBe(0);
-    expect((turnEnds[0].payload as any).turn_index).toBe(0);
+    expect((turnStarts[0]!.payload as any).turn_index).toBe(0);
+    expect((turnEnds[0]!.payload as any).turn_index).toBe(0);
   });
 
   it("T1.e (G1 regression) — mapper accepts {type:'message'} lines without dropping", () => {
@@ -135,6 +135,6 @@ describe("mapSession", () => {
     const file = writeFixture("s6.jsonl", [hdr, userMsg, assistantMsg, toolMsg, odd]);
     const custom = [...mapSession(file)].filter((e) => e.type === "custom");
     expect(custom).toHaveLength(1);
-    expect((custom[0].payload as any).custom_type).toBe("gg_role_system_fictional");
+    expect((custom[0]!.payload as any).custom_type).toBe("gg_role_system_fictional");
   });
 });

@@ -62,11 +62,11 @@ function parseArgs(argv: string[]): CliArgs {
   return {
     file: path.resolve(file),
     allBranches: flags["all-branches"] === true,
-    serverUrl: typeof flags["server-url"] === "string" ? flags["server-url"] : (process.env.OBS_SERVER_URL ?? "http://127.0.0.1:43190"),
-    token: typeof flags.token === "string" ? flags.token : (process.env.OBS_AUTH_TOKEN ?? ""),
-    pool: typeof flags.pool === "string" ? flags.pool : "default",
+    serverUrl: typeof flags["server-url"] === "string" ? flags["server-url"] : (process.env["OBS_SERVER_URL"] ?? "http://127.0.0.1:43190"),
+    token: typeof flags["token"] === "string" ? flags["token"] : (process.env["OBS_AUTH_TOKEN"] ?? ""),
+    pool: typeof flags["pool"] === "string" ? flags["pool"] : "default",
     tags,
-    quiet: flags.quiet === true || process.env.OBS_QUIET === "1",
+    quiet: flags["quiet"] === true || process.env["OBS_QUIET"] === "1",
   };
 }
 

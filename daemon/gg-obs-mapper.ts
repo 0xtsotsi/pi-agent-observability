@@ -251,7 +251,7 @@ interface SessionSessionInfo {
   model: string;
   pool: string;
   tags: string[];
-  agentName?: string;
+  agentName?: string | undefined;
 }
 
 function makeEnvelope<P>(

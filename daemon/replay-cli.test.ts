@@ -43,7 +43,7 @@ function buildJsonl(n: number): string {
 function runCli(args: string[], env: NodeJS.ProcessEnv): Promise<{ status: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn("./node_modules/.bin/tsx", ["daemon/replay-cli.ts", ...args], {
-      env: { ...process.env, PATH: `${process.cwd()}/node_modules/.bin:${process.env.PATH ?? ""}`, ...env },
+      env: { ...process.env, PATH: `${process.cwd()}/node_modules/.bin:${process.env["PATH"] ?? ""}`, ...env },
       cwd: process.cwd(),
     });
     let so = "", se = "";

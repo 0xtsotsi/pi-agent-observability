@@ -52,11 +52,11 @@ function argString(v: string | boolean | undefined, fallback = ""): string {
 export function configFromEnvAndArgs(argv: string[]): ReplayConfig {
   const args = parseArgs(argv);
   return {
-    serverUrl: argString(args["server-url"], process.env.OBS_SERVER_URL ?? "http://127.0.0.1:43190"),
-    token: argString(args.token, process.env.OBS_AUTH_TOKEN ?? ""),
-    watchDir: argString(args["watch-dir"], process.env.OBS_WATCH_DIR ?? path.join(os.homedir(), ".gg", "sessions")),
-    quiet: args.quiet === true || process.env.OBS_QUIET === "1",
-    backfillOnStart: process.env.OBS_BACKFILL !== "0",
+    serverUrl: argString(args["server-url"], process.env["OBS_SERVER_URL"] ?? "http://127.0.0.1:43190"),
+    token: argString(args["token"], process.env["OBS_AUTH_TOKEN"] ?? ""),
+    watchDir: argString(args["watch-dir"], process.env["OBS_WATCH_DIR"] ?? path.join(os.homedir(), ".gg", "sessions")),
+    quiet: args["quiet"] === true || process.env["OBS_QUIET"] === "1",
+    backfillOnStart: process.env["OBS_BACKFILL"] !== "0",
   };
 }
 
@@ -257,7 +257,7 @@ function processFile(
 export async function start(config: Partial<ReplayConfig> = {}): Promise<ReplayHandle> {
   const cfg: ReplayConfig = {
     serverUrl: config.serverUrl ?? "http://127.0.0.1:43190",
-    token: config.token ?? process.env.OBS_AUTH_TOKEN ?? "",
+    token: config.token ?? process.env["OBS_AUTH_TOKEN"] ?? "",
     watchDir: config.watchDir ?? path.join(os.homedir(), ".gg", "sessions"),
     quiet: config.quiet ?? false,
     backfillOnStart: config.backfillOnStart ?? true,
