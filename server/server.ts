@@ -388,22 +388,16 @@ app.get("/events", (c) => {
   const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 1000) : 200;
 
   try {
-    // We use the existing getSessionEventsSince (single-session, since_seq)
-    // but pass an empty session_id filter and rely on the SQL's
-    // (session_id = @session_id) check matching nothing — that returns
-    // zero rows. To get all events, we walk the events table by recent
-    // sessions instead. Trade-off: simple, no DB schema change, slow at
-    // very high event volume. Acceptable for the worker-daemon observability
-    // path (event volume is low — a few hundred per session per day).
-    const recentSessions = q.getSessionEventsSince.all({
-      session_id: "",
-      since_seq: 0,
-      type: "",
-      limit: 1, // dummy, not used because session_id='' matches nothing
-    }) as any[]; // unused
-    void recentSessions;
-
-    // Fallback: iterate all events newer than the since param, post-filter.
+    // Aggregate query: walk events newer than `since` across all sessions, post-filter.
+    // We use the existing q.getSessionEventsSince one event at a time
+    // by walking backwards from the most recent seq. This is O(N) per
+    // request and not great at scale, but sufficient for the worker observability
+    // path where event volume is low. A future optimization is to add a
+    // session-agnostic prepared statement (deferred).
+    //
+    // (Removed in PR #1 follow-up: the empty-session_id dummy query above
+    //  matched nothing and was being computed + discarded — wasteful. Now
+    //  we go straight to the maxSeq probe.)
     // We use the existing q.getSessionEventsSince one event at a time
     // by walking backwards from the most recent seq. This is O(N) per
     // request and not great at scale, but sufficient for the worker observability

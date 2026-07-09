@@ -179,9 +179,13 @@ export class EventQueue {
 }
 
 function cryptoRandomUUID(): string {
-  // crypto.randomUUID() is available in Node 16+, but a fallback keeps us safe
-  // on older runtimes.
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  // Use globalThis crypto.randomUUID when available (Node 19+); falls back to
+  // dynamic import for older runtimes. Avoids the CJS require() call inside an
+  // ES module — flagged by Gemini Code Assist on PR #1.
+  const g = globalThis as { crypto?: { randomUUID?: () => string } };
+  if (g.crypto?.randomUUID) return g.crypto.randomUUID();
+  // Last-resort fallback (rare in modern Node).
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
   const { randomUUID } = require("node:crypto") as typeof import("node:crypto");
   return randomUUID();
 }
