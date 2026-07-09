@@ -1,0 +1,48 @@
+{
+  "name": "gg-observability",
+  "version": "0.1.0",
+  "description": "Local-first observability server for AI agents (port of pi-agent-observability to Node + Hono + better-sqlite3).",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch server/server.ts",
+    "start": "tsx server/server.ts",
+    "replay": "tsx daemon/replay-cli.ts",
+    "test": "vitest run",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint .",
+    "lint:fix": "eslint --fix .",
+    "prepare": "husky"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.7",
+    "@kenkaiiii/gg-ai": "4.13.3",
+    "@kenkaiiii/ggcoder": "4.2.90",
+    "better-sqlite3": "^11.7.0",
+    "chokidar": "^4.0.3",
+    "hono": "^4.6.14"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.10.0",
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.10.5",
+    "eslint": "^9.10.0",
+    "husky": "^9.1.0",
+    "prettier": "^3.3.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3",
+    "typescript-eslint": "^8.0.0",
+    "vitest": "^4.1.10"
+  },
+  "engines": {
+    "npm": "please-use-yarn",
+    "node": ">=20"
+  },
+  "packageManager": "yarn@4.9.2",
+  "resolutions": {
+    "@kenkaiiii/gg-ai": "4.13.3",
+    "@kenkaiiii/gg-agent": "4.13.3"
+  }
+}

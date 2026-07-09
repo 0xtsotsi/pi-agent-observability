@@ -32,6 +32,9 @@ Thumbs.db
 *.db-shm
 *.db-wal
 
+# gg runtime data
+.gg/observability/
+
 # Storage / run artifacts
 storage/runs/
 *.log
@@ -49,3 +52,6 @@ logs/
 deep_docs/
 
 artifacts/
+
+# Husky internal scratch dir (the .husky/ hooks themselves are committed)
+.husky/_/

@@ -42,7 +42,7 @@ export interface ObsEventEnvelope<P = unknown> {
   /** the agent's working directory at session_start */
   cwd: string;
   /** human-friendly name from --o-name (optional) */
-  agent_name?: string;
+  agent_name?: string | undefined;
   /** logical bucket from --o-pool, defaults to "default" */
   pool: string;
   /** flat tag list from --o-tag (may be empty, never undefined) */
@@ -62,8 +62,8 @@ export interface ObsEventEnvelope<P = unknown> {
 
 export interface SessionStartPayload {
   reason: "startup" | "reload" | "new" | "resume" | "fork";
-  pi_version?: string;
-  previous_session_file?: string;
+  pi_version?: string | undefined;
+  previous_session_file?: string | undefined;
 }
 
 export interface SessionShutdownPayload {
